@@ -5510,8 +5510,9 @@ _add_snell() {
     local tag="snell-in-${port}"
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    # Snell v5/v6 uses top-level psk; users is only for separate userkeys.
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --argjson v "$version" \
-        '{"type":"snell","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"version":$v}')
+        '{"type":"snell","tag":$t,"listen":"::","listen_port":($p|tonumber),"psk":$pw,"version":$v}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
 
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg pw "$password" --argjson v "$version" \
@@ -5763,7 +5764,7 @@ _view_nodes() {
                 ;;
             "snell")
                 local password version
-                IFS=$'\t' read -r password version <<< "$(echo "$node" | jq -r '[.users[0].password, (.version // 6)] | @tsv')"
+                IFS=$'\t' read -r password version <<< "$(echo "$node" | jq -r '[.psk // .users[0].userkey // .users[0].password, (.version // 6)] | @tsv')"
                 url="snell://${password}@${link_ip}:${port}?version=${version}#$(_url_encode "$display_name")"
                 ;;
             "socks")
@@ -6485,7 +6486,7 @@ _refresh_modified_node_artifacts() {
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$method" "$password" || return 1
             ;;
         snell)
-            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            password=$(printf '%s' "$node" | jq -r '.psk // .users[0].userkey // .users[0].password')
             local version
             version=$(printf '%s' "$node" | jq -r '.version // 6')
             export NODE_PASSWORD="$password" NODE_VERSION="$version"
@@ -7168,8 +7169,10 @@ _modify_node_apply() (
             case "$variant" in
                 vless-*) _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0].uuid) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
                 nowhere) _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .password) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
-                trojan-ws-tls|hysteria2|anytls|any-reality|snell)
+                trojan-ws-tls|hysteria2|anytls|any-reality)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0].password) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
+                snell)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .psk) = $value | (.inbounds[] | select(.tag == $tag) | del(.users))' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
                 tuic)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0]) |= (.uuid = $uuid | .password = $password)' --arg tag "$tag" --arg uuid "$arg1" --arg password "$arg2" || return 1 ;;
                 shadowsocks)
