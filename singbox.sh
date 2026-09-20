@@ -282,6 +282,7 @@ _check_port_in_singbox_file() {
                     elif . == "tcp+udp" or . == "udp+tcp" then ["tcp", "udp"]
                     else [.] end)
             elif (.type == "shadowsocks" or .type == "mixed") then ["tcp", "udp"]
+            elif .type == "snell" then ["tcp"]
             elif .type == "direct" then
                 ((.network // "tcp") | if . == "tcp+udp" then ["tcp", "udp"] else [.] end)
             else ["tcp"] end;
@@ -3872,6 +3873,11 @@ _show_node_link() {
             local userinfo=$(printf '%s' "${method}:${password}" | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
             url="ss://${userinfo}@${link_ip}:${port}#$(_url_encode "$name")"
             ;;
+        "snell")
+            # 参数: password, version
+            local password="$1" version="${2:-4}"
+            url="snell://${password}@${link_ip}:${port}?version=${version}#$(_url_encode "$name")"
+            ;;
         "shadowsocks-shadowtls")
             # 参数: method, pw, spw, sni
             local method="$1" pw="$2" spw="$3" sni="$4"
@@ -5465,6 +5471,48 @@ _add_shadowsocks_menu() {
     return 0
 }
 
+_add_snell() {
+    local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
+    local port="" version=4
+
+    if [ "$BATCH_MODE" = "true" ]; then
+        port="$BATCH_PORT"
+    else
+        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        node_ip=${custom_ip:-$server_ip}
+        while true; do
+            read -p "请输入监听端口: " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _check_port_conflict "$port" "tcp" && continue
+            break
+        done
+    fi
+
+    local password=$(${SINGBOX_BIN} generate rand --hex 16)
+    local name=""
+    if [ "$BATCH_MODE" = "true" ]; then
+        name="Batch-Snell-v${version}-${port}"
+    else
+        local default_name="Snell-v${version}-${port}"
+        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        name=${custom_name:-$default_name}
+    fi
+
+    local tag="snell-in-${port}"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --argjson v "$version" \
+        '{"type":"snell","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"version":$v}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg pw "$password" --argjson v "$version" \
+        '{"name":$n,"type":"snell","server":$s,"port":($p|tonumber),"password":$pw,"version":$v}')
+    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
+    _success "Snell v${version} 节点 [${name}] 添加成功!"
+    _show_node_link "snell" "$name" "$link_ip" "$port" "$tag" "$password" "$version" || return 1
+}
+
 _add_socks() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
@@ -5704,6 +5752,11 @@ _view_nodes() {
                 local method password
                 IFS=$'\t' read -r method password <<< "$(echo "$node" | jq -r '[.method, .password] | @tsv')"
                 url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$display_name")"
+                ;;
+            "snell")
+                local password version
+                IFS=$'\t' read -r password version <<< "$(echo "$node" | jq -r '[.users[0].password, (.version // 4)] | @tsv')"
+                url="snell://${password}@${link_ip}:${port}?version=${version}#$(_url_encode "$display_name")"
                 ;;
             "socks")
                 # [资源优化] 合并2次jq为1次
@@ -6197,6 +6250,7 @@ _detect_main_node_variant() {
         elif .type == "nowhere" then "nowhere"
         elif .type == "shadowtls" then "shadowsocks-shadowtls"
         elif .type == "shadowsocks" then "shadowsocks"
+        elif .type == "snell" then "snell"
         elif .type == "socks" then "socks"
         else "unsupported"
         end
@@ -6421,6 +6475,14 @@ _refresh_modified_node_artifacts() {
             export NODE_METHOD="$method" NODE_PASSWORD="$password"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.cipher = env(NODE_METHOD) | .password = env(NODE_PASSWORD))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$method" "$password" || return 1
+            ;;
+        snell)
+            password=$(printf '%s' "$node" | jq -r '.users[0].password')
+            local version
+            version=$(printf '%s' "$node" | jq -r '.version // 4')
+            export NODE_PASSWORD="$password" NODE_VERSION="$version"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .version = (env(NODE_VERSION) | tonumber))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$version" || return 1
             ;;
         shadowsocks-shadowtls)
             inner_tag=$(printf '%s' "$node" | jq -r '.detour // empty')
@@ -7098,7 +7160,7 @@ _modify_node_apply() (
             case "$variant" in
                 vless-*) _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0].uuid) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
                 nowhere) _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .password) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
-                trojan-ws-tls|hysteria2|anytls|any-reality)
+                trojan-ws-tls|hysteria2|anytls|any-reality|snell)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0].password) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
                 tuic)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0]) |= (.uuid = $uuid | .password = $password)' --arg tag "$tag" --arg uuid "$arg1" --arg password "$arg2" || return 1 ;;
@@ -8655,8 +8717,8 @@ _batch_create_nodes() {
     local ss_occurences=0
 
     for pid in $proto_ids; do
-        if [[ ! "$pid" =~ ^(1|2|3|4|5|6|7|8|9|10|11)$ ]]; then
-            _error "协议 ID $pid 无效，请输入 1-11 范围内的协议编号。"
+        if [[ ! "$pid" =~ ^(1|2|3|4|5|6|7|8|9|10|11|12)$ ]]; then
+            _error "协议 ID $pid 无效，请输入 1-12 范围内的协议编号。"
             return 1
         fi
         if [[ "$pid" =~ ^(2|3|4)$ ]]; then
@@ -8868,6 +8930,7 @@ _batch_create_nodes() {
                 9) _add_vless_tcp || batch_failed=true ;;
                 10) _add_socks || batch_failed=true ;;
                 11) _add_nowhere || batch_failed=true ;;
+                12) _add_snell || batch_failed=true ;;
             esac
             [ "$batch_failed" = false ] || break
             ((bulk_idx++))
@@ -8913,17 +8976,18 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
     echo -e "    ${GREEN}[10]${NC} SOCKS5"
     echo -e "    ${GREEN}[11]${NC} Nowhere"
+    echo -e "    ${GREEN}[12]${NC} Snell v4"
     echo ""
 
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[12]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[13]${NC} 批量创建节点"
     echo ""
 
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
 
-    read -p "  请输入选项 [0-12]: " choice
+    read -p "  请输入选项 [0-13]: " choice
 
     # 如果输入包含逗号或空格，自动进入批量处理模式
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
@@ -8943,7 +9007,8 @@ _show_add_node_menu() {
         9) _run_main_create_transaction _add_vless_tcp ;;
         10) _run_main_create_transaction _add_socks ;;
         11) _run_main_create_transaction _add_nowhere ;;
-        12) _run_main_create_transaction _batch_create_nodes ;;
+        12) _run_main_create_transaction _add_snell ;;
+        13) _run_main_create_transaction _batch_create_nodes ;;
         0) return ;;
         *) _error "无效输入，请重试。"; return 1 ;;
     esac
