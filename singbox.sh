@@ -3875,7 +3875,7 @@ _show_node_link() {
             ;;
         "snell")
             # 参数: password, version
-            local password="$1" version="${2:-4}"
+            local password="$1" version="${2:-6}"
             url="snell://${password}@${link_ip}:${port}?version=${version}#$(_url_encode "$name")"
             ;;
         "shadowsocks-shadowtls")
@@ -5474,7 +5474,15 @@ _add_shadowsocks_menu() {
 _add_snell() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
-    local port="" version=4
+    local port="" version="${BATCH_SNELL_VERSION:-6}"
+    if [ "$BATCH_MODE" != "true" ]; then
+        read -r -p "Snell 版本 [5/6，默认6]: " requested_version
+        requested_version="${requested_version:-6}"
+        case "$requested_version" in
+            5|6) version="$requested_version" ;;
+            *) _error "Snell 版本仅支持 5 或 6。"; return 1 ;;
+        esac
+    fi
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
@@ -5755,7 +5763,7 @@ _view_nodes() {
                 ;;
             "snell")
                 local password version
-                IFS=$'\t' read -r password version <<< "$(echo "$node" | jq -r '[.users[0].password, (.version // 4)] | @tsv')"
+                IFS=$'\t' read -r password version <<< "$(echo "$node" | jq -r '[.users[0].password, (.version // 6)] | @tsv')"
                 url="snell://${password}@${link_ip}:${port}?version=${version}#$(_url_encode "$display_name")"
                 ;;
             "socks")
@@ -6479,7 +6487,7 @@ _refresh_modified_node_artifacts() {
         snell)
             password=$(printf '%s' "$node" | jq -r '.users[0].password')
             local version
-            version=$(printf '%s' "$node" | jq -r '.version // 4')
+            version=$(printf '%s' "$node" | jq -r '.version // 6')
             export NODE_PASSWORD="$password" NODE_VERSION="$version"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .version = (env(NODE_VERSION) | tonumber))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$version" || return 1
@@ -8930,14 +8938,14 @@ _batch_create_nodes() {
                 9) _add_vless_tcp || batch_failed=true ;;
                 10) _add_socks || batch_failed=true ;;
                 11) _add_nowhere || batch_failed=true ;;
-                12) _add_snell || batch_failed=true ;;
+                12) export BATCH_SNELL_VERSION=6; _add_snell || batch_failed=true ;;
             esac
             [ "$batch_failed" = false ] || break
             ((bulk_idx++))
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME BATCH_NOWHERE_NETWORK
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME BATCH_NOWHERE_NETWORK BATCH_SNELL_VERSION
 
     if [ "$batch_failed" != false ]; then
         _error "批量创建在第 $((bulk_idx + 1)) 个节点失败，整批操作将回滚。"
@@ -8976,7 +8984,7 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
     echo -e "    ${GREEN}[10]${NC} SOCKS5"
     echo -e "    ${GREEN}[11]${NC} Nowhere"
-    echo -e "    ${GREEN}[12]${NC} Snell v4"
+    echo -e "    ${GREEN}[12]${NC} Snell v5/v6 (默认 v6)"
     echo ""
 
     echo -e "  ${CYAN}【快捷功能】${NC}"
