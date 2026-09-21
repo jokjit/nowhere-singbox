@@ -14,12 +14,11 @@ SELF_SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
 SELF_SCRIPT_PATH="$(readlink -f "$SELF_SCRIPT_SOURCE")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-SINGBOX_FIXED_VERSION="nowhere-sha256-ef81126a8d9f"
+SINGBOX_FIXED_VERSION="nowhere-latest"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/jokjit/nowhere-singbox/master"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 SINGBOX_ARCHIVE_URL="${GITHUB_RAW_BASE}/sing-box.zip"
-SINGBOX_ARCHIVE_SHA256="EF81126AC8D9FD02234566D8EE844FE983973C6B4B8E840C54F0CC1309F01EB8"
 SINGBOX_ARCHIVE_NAME="sing-box.zip"
 
 # --- 核心工具函数 ---
@@ -1361,9 +1360,8 @@ _install_yq() {
 # --- 核心变量定义 ---
 export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
-export SINGBOX_FIXED_VERSION="nowhere-sha256-ef81126a8d9f"
+export SINGBOX_FIXED_VERSION="nowhere-latest"
 export SINGBOX_ARCHIVE_URL="${SINGBOX_ARCHIVE_URL:-https://raw.githubusercontent.com/jokjit/nowhere-singbox/master/sing-box.zip}"
-export SINGBOX_ARCHIVE_SHA256="${SINGBOX_ARCHIVE_SHA256:-EF81126AC8D9FD02234566D8EE844FE983973C6B4B8E840C54F0CC1309F01EB8}"
 export SINGBOX_ARCHIVE_NAME="${SINGBOX_ARCHIVE_NAME:-sing-box.zip}"
 export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
@@ -1609,18 +1607,6 @@ _install_sing_box_custom() {
             rm -rf "$temp_dir"
             return 1
         }
-    fi
-
-    if command -v sha256sum &>/dev/null; then
-        actual=$(sha256sum "$archive_path" | awk '{print tolower($1)}')
-    else
-        actual=$(openssl dgst -sha256 "$archive_path" | awk '{print tolower($NF)}')
-    fi
-    expected=$(printf '%s' "$SINGBOX_ARCHIVE_SHA256" | tr '[:upper:]' '[:lower:]')
-    if [[ ! "$actual" =~ ^[0-9a-f]{64}$ ]] || [ "$actual" != "$expected" ]; then
-        _error "sing-box 安装包 SHA-256 校验失败，已拒绝替换核心。"
-        rm -rf "$temp_dir"
-        return 1
     fi
 
     extractor=$(_archive_extractor) || {
