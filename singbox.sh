@@ -18,7 +18,7 @@ SINGBOX_FIXED_VERSION="nowhere-latest"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/jokjit/nowhere-singbox/master"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
-SINGBOX_ARCHIVE_URL="${GITHUB_RAW_BASE}/sing-box.zip"
+SINGBOX_ARCHIVE_URL="${SINGBOX_ARCHIVE_URL:-https://github.com/jokjit/nowhere-singbox/releases/download/Linux/sing-box.zip}"
 SINGBOX_ARCHIVE_NAME="sing-box.zip"
 
 # --- 核心工具函数 ---
@@ -1361,7 +1361,7 @@ _install_yq() {
 export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
 export SINGBOX_FIXED_VERSION="nowhere-latest"
-export SINGBOX_ARCHIVE_URL="${SINGBOX_ARCHIVE_URL:-https://raw.githubusercontent.com/jokjit/nowhere-singbox/master/sing-box.zip}"
+export SINGBOX_ARCHIVE_URL="${SINGBOX_ARCHIVE_URL:-https://github.com/jokjit/nowhere-singbox/releases/download/Linux/sing-box.zip}"
 export SINGBOX_ARCHIVE_NAME="${SINGBOX_ARCHIVE_NAME:-sing-box.zip}"
 export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
@@ -1587,10 +1587,10 @@ _install_sing_box_custom() {
     printf '%s\n' "$$" > "${temp_dir}/.active"
     archive_path="${temp_dir}/${SINGBOX_ARCHIVE_NAME}"
 
+    # 默认始终从 GitHub Release 下载核心包，不再自动读取脚本目录里的 sing-box.zip。
+    # 仅在显式设置 SINGBOX_ARCHIVE_PATH 时才使用手动指定的本地归档。
     if [ -n "${SINGBOX_ARCHIVE_PATH:-}" ] && [ -s "$SINGBOX_ARCHIVE_PATH" ]; then
         archive_source="$SINGBOX_ARCHIVE_PATH"
-    elif [ -s "${SCRIPT_DIR}/${SINGBOX_ARCHIVE_NAME}" ]; then
-        archive_source="${SCRIPT_DIR}/${SINGBOX_ARCHIVE_NAME}"
     else
         archive_source="$SINGBOX_ARCHIVE_URL"
     fi
