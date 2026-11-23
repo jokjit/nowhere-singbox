@@ -38,6 +38,85 @@ _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _warning() { _warn "$1"; } # 别名兼容
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
 
+
+# 下载网络策略：auto 使用 curl Happy Eyeballs；ipv4/ipv6 可强制协议。
+# 可在运行前通过环境变量设置：
+# DOWNLOAD_IP_FAMILY=auto|ipv4|ipv6（默认 auto）
+# DOWNLOAD_RETRY=3、DOWNLOAD_TIMEOUT=20（连接超时秒数）
+# GO_PROXY=https://proxy.golang.org、GO_SUMDB=sum.golang.org（yq 源码构建）
+# SINGBOX_ARCHIVE_URL、XRAY_DOWNLOAD_URL、XRAY_DIGEST_URL 可指定可信 HTTPS 镜像。
+# cloudflared 可设置 CLOUDFLARED_DOWNLOAD_URL + CLOUDFLARED_SHA256，或 API URL。
+# Alpine glibc 可设置 SINGBOX_ALPINE_GLIBC_BASE。镜像必须提供可信校验值。
+# 注意：强制 IPv6 不能让没有 AAAA 记录的 GitHub Releases 域名凭空获得 IPv6。
+DOWNLOAD_IP_FAMILY="${DOWNLOAD_IP_FAMILY:-auto}"
+DOWNLOAD_RETRY="${DOWNLOAD_RETRY:-3}"
+DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-20}"
+
+_download_file() {
+    local url="$1" output="$2" family="${DOWNLOAD_IP_FAMILY:-auto}"
+    [[ "$url" == https://* ]] || { _error "拒绝下载非 HTTPS URL: $url"; return 1; }
+    mkdir -p "$(dirname "$output")" || return 1
+    local -a family_args=()
+    case "$family" in
+        auto) family_args=(--happy-eyeballs-timeout-ms 1000) ;;
+        ipv4|4) family_args=(-4) ;;
+        ipv6|6) family_args=(-6) ;;
+        *) _error "DOWNLOAD_IP_FAMILY 仅支持 auto、ipv4 或 ipv6。"; return 1 ;;
+    esac
+    curl -fLsS "${family_args[@]}" --connect-timeout "$DOWNLOAD_TIMEOUT" \
+        --max-time 0 --retry "$DOWNLOAD_RETRY" --retry-delay 1 \
+        --output "$output" "$url" || { rm -f -- "$output"; return 1; }
+    [ -s "$output" ] || { rm -f -- "$output"; return 1; }
+}
+
+_download_text() {
+    local url="$1" family="${DOWNLOAD_IP_FAMILY:-auto}"
+    [[ "$url" == https://* ]] || return 1
+    local -a family_args=()
+    case "$family" in
+        auto) family_args=(--happy-eyeballs-timeout-ms 1000) ;;
+        ipv4|4) family_args=(-4) ;;
+        ipv6|6) family_args=(-6) ;;
+        *) return 1 ;;
+    esac
+    curl -fLsS "${family_args[@]}" --connect-timeout "$DOWNLOAD_TIMEOUT" \
+        --max-time 30 --retry "$DOWNLOAD_RETRY" --retry-delay 1 "$url"
+}
+
+_install_yq_via_go_proxy() {
+    _warn "GitHub API/Release 不可达，尝试通过 Go 官方模块代理构建 Mike Farah yq v4。"
+    if ! command -v go >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go || return 1
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache go || return 1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y golang || return 1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y golang || return 1
+        else
+            _error "未找到可自动安装 Go 的包管理器。"; return 1
+        fi
+    fi
+    local gobin_tmp
+    gobin_tmp=$(mktemp -d /var/tmp/singboxlite-yq-go.XXXXXX) || return 1
+    if ! GOPROXY="${GO_PROXY:-https://proxy.golang.org}" \
+        GOSUMDB="${GO_SUMDB:-sum.golang.org}" GOBIN="$gobin_tmp" \
+        go install github.com/mikefarah/yq/v4@latest; then
+        rm -rf -- "$gobin_tmp"
+        _error "Go 模块代理构建 yq 失败；未安装未经校验的替代版本。"
+        return 1
+    fi
+    if [ ! -s "$gobin_tmp/yq" ] || ! "$gobin_tmp/yq" --version 2>&1 | grep -qE 'version v?4\.'; then
+        rm -rf -- "$gobin_tmp"
+        _error "Go 构建产物不是可用的 Mike Farah yq v4。"
+        return 1
+    fi
+    install -m 0755 "$gobin_tmp/yq" "$YQ_BINARY" || { rm -rf -- "$gobin_tmp"; return 1; }
+    rm -rf -- "$gobin_tmp"
+    _success "已通过 Go 官方模块代理安装 $($YQ_BINARY --version 2>&1 | head -n1)"
+}
+
 # Podman 容器通常没有 NET_ADMIN，nftables 转发会由 advanced_relay.sh
 # 自动降级到 sing-box 用户态转发。检测到该环境时不安装不会被使用的
 # 可选包，避免 128M 容器在 apk 解包时触发 OOM。
@@ -1294,67 +1373,59 @@ _release_install_cache() {
     return 0
 }
 
-# 安装 yq
+# 安装 yq（优先官方 Release + SHA256；IPv6-only 时回退 Go 官方模块代理）
 _install_yq() {
-    if [ ! -x "$YQ_BINARY" ] || ! "$YQ_BINARY" --version >/dev/null 2>&1; then
-        _info "安装 yq..."
-        local arch
-        arch=$(uname -m)
-        case $arch in
-            x86_64|amd64) arch='amd64' ;;
-            aarch64|arm64) arch='arm64' ;;
-            armv7l|armv7|armhf) arch='arm' ;;
-            *) _error "yq 不支持当前架构: $(uname -m)"; return 1 ;;
-        esac
-        local asset="yq_linux_${arch}"
-        local release_json release_tag release_base
-        release_json=$(curl -fsSL --max-time 15 https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null) || true
-        release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
-        if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            _error "无法解析 yq 官方 release tag。"
-            return 1
-        fi
-        release_base="https://github.com/mikefarah/yq/releases/download/${release_tag}"
-
-        local tmp_yq checksums_tmp order_tmp
-        tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
-        checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
-        order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
-        if ! wget -qO "$tmp_yq" "${release_base}/${asset}" \
-            || ! wget -qO "$checksums_tmp" "${release_base}/checksums" \
-            || ! wget -qO "$order_tmp" "${release_base}/checksums_hashes_order"; then
-            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-            _error "yq 或官方校验文件下载失败。"
-            return 1
-        fi
-
-        local sha_line sha_field expected_sha actual_sha
-        sha_line=$(grep -n -x -m 1 'SHA-256' "$order_tmp" | cut -d: -f1)
-        if ! [[ "$sha_line" =~ ^[0-9]+$ ]]; then
-            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-            _error "yq 官方校验文件缺少 SHA-256 定义。"
-            return 1
-        fi
-        sha_field=$((sha_line + 1))
-        expected_sha=$(awk -v name="$asset" -v field="$sha_field" '
-            $1 == name { count++; value=$field }
-            END { if (count == 1) print tolower(value) }
-        ' "$checksums_tmp")
-        actual_sha=$(openssl dgst -sha256 "$tmp_yq" 2>/dev/null | awk '{print tolower($NF)}')
-        if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$actual_sha" != "$expected_sha" ]; then
-            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-            _error "yq SHA-256 校验失败，拒绝安装。"
-            return 1
-        fi
-        rm -f -- "$checksums_tmp" "$order_tmp"
-
-        if ! chmod 755 "$tmp_yq" || ! "$tmp_yq" --version >/dev/null 2>&1 \
-            || ! mv -f "$tmp_yq" "$YQ_BINARY"; then
-            rm -f -- "$tmp_yq"
-            _error "yq 下载或完整性自检失败。"
-            return 1
-        fi
+    if [ -x "$YQ_BINARY" ] && "$YQ_BINARY" --version 2>&1 | grep -qE 'version v?4\.'; then
+        return 0
     fi
+    _info "安装 Mike Farah yq v4..."
+    local arch asset release_json release_tag release_base
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        armv7l|armv7|armhf) arch=arm ;;
+        *) _error "yq 不支持当前架构: $(uname -m)"; return 1 ;;
+    esac
+    asset="yq_linux_${arch}"
+    release_json=$( _download_text "https://api.github.com/repos/mikefarah/yq/releases/latest" 2>/dev/null ) || release_json=""
+    release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
+    if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        _install_yq_via_go_proxy && return 0
+        _error "无法通过 GitHub API 或 Go 官方模块代理安装 yq v4。"
+        return 1
+    fi
+    release_base="https://github.com/mikefarah/yq/releases/download/${release_tag}"
+    local tmp_yq checksums_tmp order_tmp
+    tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
+    checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
+    order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
+    if ! _download_file "${release_base}/${asset}" "$tmp_yq" \
+        || ! _download_file "${release_base}/checksums" "$checksums_tmp" \
+        || ! _download_file "${release_base}/checksums_hashes_order" "$order_tmp"; then
+        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+        _install_yq_via_go_proxy && return 0
+        _error "yq 官方 Release 下载失败，Go 模块代理回退也未成功。"
+        return 1
+    fi
+    local sha_line sha_field expected_sha actual_sha
+    sha_line=$(grep -n -x -m 1 'SHA-256' "$order_tmp" | cut -d: -f1)
+    if ! [[ "$sha_line" =~ ^[0-9]+$ ]]; then
+        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+        _error "yq 官方校验文件缺少 SHA-256 定义。"; return 1
+    fi
+    sha_field=$((sha_line + 1))
+    expected_sha=$(awk -v name="$asset" -v field="$sha_field" '$1 == name { count++; value=$field } END { if (count == 1) print tolower(value) }' "$checksums_tmp")
+    actual_sha=$(openssl dgst -sha256 "$tmp_yq" 2>/dev/null | awk '{print tolower($NF)}')
+    rm -f -- "$checksums_tmp" "$order_tmp"
+    if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$actual_sha" != "$expected_sha" ]; then
+        rm -f -- "$tmp_yq"
+        _error "yq SHA-256 校验失败，拒绝安装。"; return 1
+    fi
+    if ! chmod 755 "$tmp_yq" || ! "$tmp_yq" --version 2>&1 | grep -qE 'version v?4\.' || ! mv -f "$tmp_yq" "$YQ_BINARY"; then
+        rm -f -- "$tmp_yq"
+        _error "yq 下载或版本自检失败。"; return 1
+    fi
+    _success "yq 安装成功: $($YQ_BINARY --version 2>&1 | head -n1)"
 }
 
 # --- 核心变量定义 ---
@@ -1401,12 +1472,12 @@ trap _cleanup_main_temp_files EXIT
 _ensure_alpine_glibc() {
     command -v apk >/dev/null 2>&1 || return 0
     apk info -e glibc >/dev/null 2>&1 && apk info -e glibc-bin >/dev/null 2>&1 && return 0
-    local version="${SINGBOX_ALPINE_GLIBC_VERSION:-2.35-r1}" base="https://github.com/sgerrand/alpine-pkg-glibc/releases/download"
+    local version="${SINGBOX_ALPINE_GLIBC_VERSION:-2.35-r1}" base="${SINGBOX_ALPINE_GLIBC_BASE:-https://github.com/sgerrand/alpine-pkg-glibc/releases/download}"
     mkdir -p /etc/apk/keys
-    wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub || return 1
+    _download_file https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub /etc/apk/keys/sgerrand.rsa.pub || return 1
     local tmp; tmp=$(mktemp -d) || return 1
-    wget -q -O "$tmp/glibc.apk" "$base/$version/glibc-$version.apk" || { rm -rf "$tmp"; return 1; }
-    wget -q -O "$tmp/glibc-bin.apk" "$base/$version/glibc-bin-$version.apk" || { rm -rf "$tmp"; return 1; }
+    _download_file "$base/$version/glibc-$version.apk" "$tmp/glibc.apk" || { rm -rf "$tmp"; return 1; }
+    _download_file "$base/$version/glibc-bin-$version.apk" "$tmp/glibc-bin.apk" || { rm -rf "$tmp"; return 1; }
     apk add --no-cache "$tmp/glibc.apk" "$tmp/glibc-bin.apk" >/dev/null 2>&1
     local rc=$?; rm -rf "$tmp"; return $rc
 }
@@ -1596,7 +1667,7 @@ _install_sing_box_custom() {
     fi
     _info "正在获取包含 Nowhere 协议的 sing-box 核心包..."
     if [[ "$archive_source" == https://* ]]; then
-        wget -qO "$archive_path" "$archive_source" || {
+        _download_file "$archive_source" "$archive_path" || {
             _error "Nowhere 核心包下载失败: $archive_source"
             rm -rf "$temp_dir"
             return 1
@@ -1755,30 +1826,35 @@ _install_cloudflared() {
     esac
 
     local asset_name="cloudflared-linux-${arch_tag}"
-    local asset_count asset_info download_url asset_digest expected actual
-    if ! asset_info=$(curl -fsSL --retry 3 --connect-timeout 10 https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r --arg name "$asset_name" '
-        [.assets[] | select(.name == $name)] as $matches
-        | [($matches | length), ($matches[0].browser_download_url // ""), ($matches[0].digest // "")]
-        | @tsv
-    '); then
-        _error "无法读取 cloudflared 官方发布信息。"
-        return 1
+    local asset_count asset_info download_url asset_digest expected actual release_json
+    if [ -n "${CLOUDFLARED_DOWNLOAD_URL:-}" ] && [ -n "${CLOUDFLARED_SHA256:-}" ]; then
+        download_url="$CLOUDFLARED_DOWNLOAD_URL"
+        asset_digest="sha256:${CLOUDFLARED_SHA256,,}"
+    else
+        release_json=$(_download_text "${CLOUDFLARED_RELEASE_API_URL:-https://api.github.com/repos/cloudflare/cloudflared/releases/latest}") || {
+            _error "无法访问 cloudflared 发布 API。IPv6-only 环境可设置 CLOUDFLARED_RELEASE_API_URL，或同时设置 CLOUDFLARED_DOWNLOAD_URL 与 CLOUDFLARED_SHA256 使用可信镜像。"
+            return 1
+        }
+        asset_info=$(printf '%s' "$release_json" | jq -r --arg name "$asset_name" '
+            [.assets[] | select(.name == $name)] as $matches
+            | [($matches | length), ($matches[0].browser_download_url // ""), ($matches[0].digest // "")]
+            | @tsv
+        ') || return 1
+        IFS=$'\t' read -r asset_count download_url asset_digest <<< "$asset_info"
+        if [ "$asset_count" != "1" ]; then
+            _error "cloudflared 官方发布中目标资产数量异常 (${asset_count:-无法解析})。"
+            return 1
+        fi
     fi
-    IFS=$'\t' read -r asset_count download_url asset_digest <<< "$asset_info"
-    if [ "$asset_count" != "1" ]; then
-        _error "cloudflared 官方发布中目标资产数量异常 (${asset_count:-无法解析})。"
-        return 1
-    fi
-    if [[ "$download_url" != https://github.com/cloudflare/cloudflared/releases/download/* ]] \
-        || [[ ! "$asset_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        _error "cloudflared 官方资产缺少可信下载地址或 API SHA-256 摘要，已拒绝安装。"
+    if [[ "$download_url" != https://* ]] || [[ ! "$asset_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        _error "cloudflared 下载地址必须为 HTTPS，且必须提供有效 SHA-256 摘要，已拒绝安装。"
         return 1
     fi
 
     mkdir -p "$(dirname "$CLOUDFLARED_BIN")" || return 1
     local tmp_cloudflared
     tmp_cloudflared=$(mktemp "$(dirname "$CLOUDFLARED_BIN")/.cloudflared.new.XXXXXX") || return 1
-    if ! wget -qO "$tmp_cloudflared" "$download_url"; then
+    if ! _download_file "$download_url" "$tmp_cloudflared"; then
         rm -f "$tmp_cloudflared"
         _error "cloudflared 下载失败!"
         return 1
@@ -7549,7 +7625,7 @@ _download_bash_script_atomic() {
     mkdir -p "$(dirname "$target")" || return 1
     local tmp
     tmp=$(mktemp "$(dirname "$target")/.${label}.new.XXXXXX") || return 1
-    if ! wget -qO "$tmp" "$url" || [ ! -s "$tmp" ]; then
+    if ! _download_file "$url" "$tmp" || [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         _error "${label} 下载失败或内容为空。"
         return 1
@@ -7840,15 +7916,15 @@ _do_update_xray() {
         *)             _error "Xray 不支持当前架构: $arch"; return 1 ;;
     esac
 
-    local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip"
-    local digest_url="${download_url}.dgst"
+    local download_url="${XRAY_DOWNLOAD_URL:-https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip}"
+    local digest_url="${XRAY_DIGEST_URL:-${download_url}.dgst}"
     local tmp_dir
     mkdir -p /var/tmp || return 1
     tmp_dir=$(mktemp -d /var/tmp/.xray-install.XXXXXX) || return 1
     local tmp_zip="${tmp_dir}/xray.zip"
 
     _info "下载地址: ${download_url}"
-    if ! wget -qO "$tmp_zip" "$download_url" || ! wget -qO "${tmp_zip}.dgst" "$digest_url"; then
+    if ! _download_file "$download_url" "$tmp_zip" || ! _download_file "$digest_url" "${tmp_zip}.dgst"; then
         _error "Xray 安装包或官方摘要下载失败！"
         rm -rf "$tmp_dir"
         return 1
