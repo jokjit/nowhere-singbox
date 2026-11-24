@@ -52,48 +52,164 @@ DOWNLOAD_IP_FAMILY="${DOWNLOAD_IP_FAMILY:-auto}"
 DOWNLOAD_RETRY="${DOWNLOAD_RETRY:-3}"
 DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-20}"
 
-_download_file() {
-    local url="$1" output="$2" family="${DOWNLOAD_IP_FAMILY:-auto}"
-    [[ "$url" == https://* ]] || { _error "拒绝下载非 HTTPS URL: $url"; return 1; }
-    mkdir -p "$(dirname "$output")" || return 1
-    local -a family_args=()
+# INSTALL_DOWNLOAD_PROXY 可指定已有 WARP 的 socks5h://127.0.0.1:40000。
+# INSTALL_PACKAGE_PROXY 接受 HTTP(S) 代理，同时供 Go 构建使用。
+# 若只配置 INSTALL_PACKAGE_PROXY，curl 安装下载也使用此代理。
+_download_curl() {
+    local url="$1" transfer_timeout="$2" family="${DOWNLOAD_IP_FAMILY:-auto}"
+    local proxy="${INSTALL_DOWNLOAD_PROXY:-${INSTALL_PACKAGE_PROXY:-}}"
+    shift 2
+    [[ "$url" == https://* ]] || { _error "拒绝下载非 HTTPS URL。"; return 1; }
+    local -a route_args=()
     case "$family" in
-        auto) family_args=(--happy-eyeballs-timeout-ms 1000) ;;
-        ipv4|4) family_args=(-4) ;;
-        ipv6|6) family_args=(-6) ;;
+        auto) route_args=(--happy-eyeballs-timeout-ms 1000) ;;
+        ipv4|4) route_args=(-4) ;;
+        ipv6|6) route_args=(-6) ;;
         *) _error "DOWNLOAD_IP_FAMILY 仅支持 auto、ipv4 或 ipv6。"; return 1 ;;
     esac
-    curl -fLsS "${family_args[@]}" --connect-timeout "$DOWNLOAD_TIMEOUT" \
-        --max-time 0 --retry "$DOWNLOAD_RETRY" --retry-delay 1 \
-        --output "$output" "$url" || { rm -f -- "$output"; return 1; }
-    [ -s "$output" ] || { rm -f -- "$output"; return 1; }
+    if [ -n "$proxy" ]; then
+        case "$proxy" in
+            http://?*|https://?*|socks5h://?*) ;;
+            *) _error "安装下载代理须使用 http://、https:// 或 socks5h://。"; return 1 ;;
+        esac
+        # 强制地址族只用于直连，否则 -6 会妨碍连接 IPv4 回环代理。
+        route_args=(--proxy "$proxy" --noproxy '')
+    fi
+    local status
+    curl -fLsS "${route_args[@]}" --proto '=https' --proto-redir '=https' \
+        --connect-timeout "$DOWNLOAD_TIMEOUT" --max-time "$transfer_timeout" \
+        --retry "$DOWNLOAD_RETRY" --retry-max-time "${DOWNLOAD_RETRY_MAX_TIME:-60}" \
+        --retry-delay 1 "$@" -- "$url" && return 0
+    status=$?
+    if [ -n "$proxy" ]; then
+        _error "安装下载经代理失败（curl ${status}）。请检查代理、目标地址及 IPv4 出口。"
+    else
+        _error "安装下载失败（curl ${status}）。IPv6-only 主机可使用可信双栈镜像或设置 INSTALL_DOWNLOAD_PROXY。"
+    fi
+    return "$status"
+}
+
+_download_file() {
+    local url="$1" output="$2" tmp
+    mkdir -p "$(dirname "$output")" || return 1
+    tmp=$(mktemp "${output}.part.XXXXXX") || return 1
+    if _download_curl "$url" "${DOWNLOAD_TRANSFER_TIMEOUT:-300}" --output "$tmp" &&
+        [ -s "$tmp" ] && mv -f -- "$tmp" "$output"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
 }
 
 _download_text() {
-    local url="$1" family="${DOWNLOAD_IP_FAMILY:-auto}"
-    [[ "$url" == https://* ]] || return 1
-    local -a family_args=()
-    case "$family" in
-        auto) family_args=(--happy-eyeballs-timeout-ms 1000) ;;
-        ipv4|4) family_args=(-4) ;;
-        ipv6|6) family_args=(-6) ;;
-        *) return 1 ;;
-    esac
-    curl -fLsS "${family_args[@]}" --connect-timeout "$DOWNLOAD_TIMEOUT" \
-        --max-time 30 --retry "$DOWNLOAD_RETRY" --retry-delay 1 "$url"
+    _download_curl "$1" 30
 }
+
+# Only public GitHub release paths and the release API are forwarded.
+_github_install_mirrors() {
+    local url="$1" host
+    local defaults='git.7171971.xyz ghproxy.site v6.gh-proxy.org'
+    case "$url" in
+        https://github.com/*/releases/download/*|https://github.com/*/releases/latest/download/*)
+            defaults+=' gh.monlor.com gh-proxy.com' ;;
+        https://api.github.com/repos/*/releases/latest)
+            defaults+=' gh-proxy.com' ;;
+        *) return 0 ;;
+    esac
+    [[ "$url" != *[[:space:]\?\#]* ]] || return 0
+    [ "${GITHUB_ACCELERATION:-1}" = 1 ] || return 0
+    local -a hosts=()
+    IFS=$' \t\n' read -r -d '' -a hosts < <(printf '%s\0' "${GITHUB_ACCEL_HOSTS-$defaults}")
+    for host in "${hosts[@]}"; do
+        [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || continue
+        printf 'https://%s/%s\n' "$host" "$url"
+    done
+}
+
+_download_install_asset() {
+    local mirrors
+    mirrors=$(_github_install_mirrors "$1")
+    _download_sources "$1" "$2" '' "$mirrors"
+}
+
+_download_release_json() {
+    local primary="$1" url json mirrors
+    mirrors=$(_github_install_mirrors "$primary")
+    local -a urls=()
+    IFS=$' \t\n' read -r -d '' -a urls < <(printf '%s\0' "$mirrors")
+    for url in "$primary" "${urls[@]}"; do
+        if [ "$url" != "$primary" ]; then _info "尝试 GitHub API 加速节点：${url#https://}"; fi
+        if json=$(_download_text "$url") && jq -e 'type == "object" and (.tag_name | type == "string" and length > 0)' <<< "$json" >/dev/null 2>&1; then
+            printf '%s\n' "$json"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_verify_install_sha256() {
+    local file="$1" expected="${2,,}" sum
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sum=$(sha256sum < "$file") || return 1
+        sum=${sum%% *}
+    else
+        sum=$(openssl dgst -sha256 < "$file") || return 1
+        sum=${sum##* }
+    fi
+    [[ "${sum,,}" == "$expected" ]]
+}
+
+# 候选 URL 以空白分隔；只在下载失败时换源，内容校验失败立即终止。
+_download_verified_sources() {
+    [[ "$3" =~ ^[A-Fa-f0-9]{64}$ ]] || { _error "多源下载需要独立可信的 SHA-256。"; return 1; }
+    _download_sources "$@"
+}
+
+_download_sources() (
+    local primary="$1" output="$2" expected="$3" mirrors="${4:-}" url tmp index=0
+    [[ -z "$expected" || "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || { _error "SHA-256 须为 64 位十六进制。"; return 1; }
+    local -a sources=()
+    IFS=$' \t\n' read -r -d '' -a sources < <(printf '%s\0' "$mirrors")
+    tmp=$(mktemp "${output}.verify.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    for url in "$primary" "${sources[@]}"; do
+        ((++index))
+        [[ "$url" == https://?* ]] || { _error "下载源 #${index} 必须使用 HTTPS。"; return 1; }
+        if [ "$index" -gt 1 ]; then _info "尝试下载备用源 #$((index - 1))。"; fi
+        if ! _download_file "$url" "$tmp"; then continue; fi
+        if [ -n "$expected" ] && ! _verify_install_sha256 "$tmp" "$expected"; then
+            _error "下载源 #${index} SHA-256 不匹配，停止安装。"
+            return 1
+        fi
+        mv -fT -- "$tmp" "$output" || return 1
+        return 0
+    done
+    return 1
+)
+
+_with_package_proxy() (
+    local proxy="${INSTALL_PACKAGE_PROXY:-}"
+    if [ -n "$proxy" ]; then
+        case "$proxy" in
+            http://?*|https://?*) ;;
+            *) _error "INSTALL_PACKAGE_PROXY 须使用 HTTP(S)；纯 SOCKS 请用于 INSTALL_DOWNLOAD_PROXY。"; return 1 ;;
+        esac
+        export http_proxy="$proxy" https_proxy="$proxy" HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy"
+        unset no_proxy NO_PROXY
+    fi
+    "$@"
+)
 
 _install_yq_via_go_proxy() {
     _warn "GitHub API/Release 不可达，尝试通过 Go 官方模块代理构建 Mike Farah yq v4。"
     if ! command -v go >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go || return 1
-        elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache go || return 1
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y golang || return 1
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y golang || return 1
+        if command -v apk >/dev/null 2>&1; then
+            _pkg_install go || return 1
+        elif command -v apt-get >/dev/null 2>&1; then
+            _pkg_install golang-go || return 1
+        elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+            _pkg_install golang || return 1
         else
             _error "未找到可自动安装 Go 的包管理器。"; return 1
         fi
@@ -102,7 +218,7 @@ _install_yq_via_go_proxy() {
     gobin_tmp=$(mktemp -d /var/tmp/singboxlite-yq-go.XXXXXX) || return 1
     if ! GOPROXY="${GO_PROXY:-https://proxy.golang.org}" \
         GOSUMDB="${GO_SUMDB:-sum.golang.org}" GOBIN="$gobin_tmp" \
-        go install github.com/mikefarah/yq/v4@latest; then
+        _with_package_proxy go install github.com/mikefarah/yq/v4@latest; then
         rm -rf -- "$gobin_tmp"
         _error "Go 模块代理构建 yq 失败；未安装未经校验的替代版本。"
         return 1
@@ -735,6 +851,126 @@ _manage_service() {
 
 # 智能包管理
 _pkg_install() {
+    _with_package_proxy _pkg_install_with_fallback "$@"
+}
+
+_pkg_install_with_fallback() {
+    _pkg_install_impl "$@" && return 0
+    if command -v apk &>/dev/null; then
+        _apk_mirror_install "$@"
+    elif command -v apt-get &>/dev/null && [ -n "${INSTALL_APT_FALLBACK_LISTS:-${INSTALL_APT_FALLBACK_LIST:-}}" ]; then
+        local list
+        local -a lists=()
+        if [ -n "${INSTALL_APT_FALLBACK_LISTS:-}" ]; then
+            IFS=$' \t\n' read -r -d '' -a lists < <(printf '%s\0' "$INSTALL_APT_FALLBACK_LISTS")
+        else
+            lists=("$INSTALL_APT_FALLBACK_LIST")
+        fi
+        for list in "${lists[@]}"; do
+            _apt_mirror_install "$list" "$@" && return 0
+        done
+        return 1
+    elif command -v apt-get &>/dev/null; then
+        _apt_official_fallback "$@"
+    else
+        return 1
+    fi
+}
+
+# 保留系统仓库配置；为当前版本临时指定 main / community，不跨版本。
+_apk_mirror_install() (
+    local version branch root roots repo_file
+    IFS= read -r version < /etc/alpine-release || return 1
+    [[ "$version" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]] || return 1
+    branch="v${BASH_REMATCH[1]}"
+    # 3.x.0 也可能是 edge 容器：探测到 edge 配置时不切换到稳定分支。
+    if grep -Eq '/edge(/|[[:space:]]|$)' /etc/apk/repositories /etc/apk/repositories.d/*.list 2>/dev/null; then
+        branch=edge
+    fi
+    roots="${INSTALL_ALPINE_MIRRORS-https://dl-cdn.alpinelinux.org/alpine https://mirrors.tuna.tsinghua.edu.cn/alpine https://mirrors.ustc.edu.cn/alpine}"
+    local -a candidates=()
+    IFS=$' \t\n' read -r -d '' -a candidates < <(printf '%s\0' "$roots")
+    [ "${#candidates[@]}" -gt 0 ] || return 1
+    repo_file=$(mktemp /tmp/sb-apk-repos.XXXXXX) || return 1
+    trap 'rm -f -- "$repo_file"' EXIT
+    for root in "${candidates[@]}"; do
+        [[ "$root" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$ ]] || continue
+        root=${root%/}
+        printf '%s/%s/main\n%s/%s/community\n' "$root" "$branch" "$root" "$branch" > "$repo_file" || return 1
+        _info "尝试 Alpine 备用源：${root} (${branch})"
+        apk --repositories-file "$repo_file" --timeout 15 add --no-cache "$@" && return 0
+    done
+    return 1
+)
+
+# 仅在发行版、代号和架构都明确时生成临时官方源，不猜测衍生发行版。
+_apt_official_fallback() (
+    [ "${INSTALL_APT_OFFICIAL_FALLBACK:-1}" = 1 ] || return 1
+    local ID= VERSION_CODENAME= UBUNTU_CODENAME= codename arch key base security components file
+    [ -r /etc/os-release ] || return 1
+    . /etc/os-release
+    codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+    [[ "$codename" =~ ^[a-z][a-z0-9]+$ ]] || return 1
+    arch=$(dpkg --print-architecture) || return 1
+    case "$ID:$arch" in
+        debian:amd64|debian:arm64|debian:armhf)
+            # sid/testing 没有这里使用的标准安全更新路径。
+            case "$codename" in sid|testing|unstable|experimental|forky) return 1 ;; esac
+            key=/usr/share/keyrings/debian-archive-keyring.gpg
+            base=https://deb.debian.org/debian
+            security=https://deb.debian.org/debian-security
+            components=main ;;
+        ubuntu:amd64)
+            key=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+            base=https://archive.ubuntu.com/ubuntu
+            security=https://security.ubuntu.com/ubuntu
+            components='main universe' ;;
+        ubuntu:arm64|ubuntu:armhf)
+            key=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+            base=https://ports.ubuntu.com/ubuntu-ports
+            security=$base
+            components='main universe' ;;
+        *) return 1 ;;
+    esac
+    [ -r "$key" ] || return 1
+    file=$(mktemp /tmp/sb-apt.XXXXXX.list) || return 1
+    trap 'rm -f -- "$file"' EXIT
+    printf 'deb [signed-by=%s] %s %s %s\n' \
+        "$key" "$base" "$codename" "$components" \
+        "$key" "$base" "${codename}-updates" "$components" \
+        "$key" "$security" "${codename}-security" "$components" > "$file" || return 1
+    chmod 644 "$file" || return 1
+    _apt_mirror_install "$file" "$@"
+)
+
+# 使用完整的临时 .list，APT 索引独立存放，不改系统 sources 或默认索引。
+_apt_mirror_install() (
+    local list="$1" work
+    shift
+    [ -f "$list" ] && [ -r "$list" ] || { _error "APT 备用 .list 无法读取。"; return 1; }
+    work=$(mktemp -d /var/lib/apt/sb-mirror.XXXXXX) || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    chmod 755 "$work" || return 1
+    mkdir -p "$work/lists" || return 1
+    chmod 755 "$work/lists" || return 1
+    local -a args=(-o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=-
+        -o "Dir::State::lists=$work/lists" -o APT::Get::List-Cleanup=0
+        -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15
+        -o Acquire::Retries=1 -o APT::Update::Error-Mode=any)
+    _info "尝试 APT 备用源列表。"
+    apt-get "${args[@]}" update || return 1
+    if _is_podman_environment; then
+        local pkg
+        for pkg in "$@"; do
+            if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then continue; fi
+            DEBIAN_FRONTEND=noninteractive apt-get "${args[@]}" install -y --no-install-recommends -o Dpkg::Use-Pty=0 "$pkg" || return 1
+        done
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get "${args[@]}" install -y "$@"
+    fi
+)
+
+_pkg_install_impl() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
     if command -v apk &>/dev/null; then
@@ -1373,12 +1609,27 @@ _release_install_cache() {
     return 0
 }
 
-# 安装 yq（优先官方 Release + SHA256；IPv6-only 时回退 Go 官方模块代理）
+# Alpine 社区包是 Mike Farah yq v4；不使用 Debian/Ubuntu 的同名 Python 包。
+_install_yq_from_alpine() (
+    command -v apk >/dev/null 2>&1 || return 1
+    if [ ! -x /usr/bin/yq ]; then _pkg_install yq || return 1; fi
+    [ -x /usr/bin/yq ] && /usr/bin/yq --version 2>&1 | grep -Eq 'mikefarah/yq.*version v?4\.' || return 1
+    local tmp
+    tmp=$(mktemp "$(dirname "$YQ_BINARY")/.yq.repo.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    install -m 0755 /usr/bin/yq "$tmp" && mv -fT -- "$tmp" "$YQ_BINARY"
+)
+
+# 安装 yq（Alpine 签名仓库，或官方 Release + SHA256，最后 Go 模块代理）
 _install_yq() {
     if [ -x "$YQ_BINARY" ] && "$YQ_BINARY" --version 2>&1 | grep -qE 'version v?4\.'; then
         return 0
     fi
     _info "安装 Mike Farah yq v4..."
+    if _install_yq_from_alpine; then
+        _success "已从 Alpine 签名仓库安装 Mike Farah yq v4。"
+        return 0
+    fi
     local arch asset release_json release_tag release_base
     case "$(uname -m)" in
         x86_64|amd64) arch=amd64 ;;
@@ -1387,7 +1638,20 @@ _install_yq() {
         *) _error "yq 不支持当前架构: $(uname -m)"; return 1 ;;
     esac
     asset="yq_linux_${arch}"
-    release_json=$( _download_text "https://api.github.com/repos/mikefarah/yq/releases/latest" 2>/dev/null ) || release_json=""
+    if [ -n "${YQ_DOWNLOAD_URL:-}${YQ_DOWNLOAD_MIRRORS:-}${YQ_DOWNLOAD_SHA256:-}" ]; then
+        local pinned_tmp
+        pinned_tmp=$(mktemp "$(dirname "$YQ_BINARY")/.yq.pinned.XXXXXX") || return 1
+        if ! _download_verified_sources "${YQ_DOWNLOAD_URL:-}" "$pinned_tmp" "${YQ_DOWNLOAD_SHA256:-}" "${YQ_DOWNLOAD_MIRRORS:-}" ||
+            ! chmod 755 "$pinned_tmp" || ! "$pinned_tmp" --version 2>&1 | grep -Eq 'mikefarah/yq.*version v?4\.' ||
+            ! mv -fT -- "$pinned_tmp" "$YQ_BINARY"; then
+            rm -f -- "$pinned_tmp"
+            _error "指定的 yq 下载、校验或版本检查失败。"
+            return 1
+        fi
+        _success "已安装指定的 Mike Farah yq v4。"
+        return 0
+    fi
+    release_json=$(_download_release_json "https://api.github.com/repos/mikefarah/yq/releases/latest") || release_json=""
     release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
     if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         _install_yq_via_go_proxy && return 0
@@ -1399,9 +1663,9 @@ _install_yq() {
     tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
     checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
     order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
-    if ! _download_file "${release_base}/${asset}" "$tmp_yq" \
-        || ! _download_file "${release_base}/checksums" "$checksums_tmp" \
-        || ! _download_file "${release_base}/checksums_hashes_order" "$order_tmp"; then
+    if ! _download_install_asset "${release_base}/${asset}" "$tmp_yq" \
+        || ! _download_install_asset "${release_base}/checksums" "$checksums_tmp" \
+        || ! _download_install_asset "${release_base}/checksums_hashes_order" "$order_tmp"; then
         rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
         _install_yq_via_go_proxy && return 0
         _error "yq 官方 Release 下载失败，Go 模块代理回退也未成功。"
@@ -1459,6 +1723,8 @@ esac
 
 export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
 
+export -f _with_package_proxy _pkg_install_impl _pkg_install_with_fallback _apk_mirror_install _apt_mirror_install _apt_official_fallback _is_podman_environment
+
 export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
 server_ip=""
@@ -1469,18 +1735,40 @@ _cleanup_main_temp_files() {
 }
 trap _cleanup_main_temp_files EXIT
 # 依赖安装
-_ensure_alpine_glibc() {
+_ensure_alpine_glibc() (
     command -v apk >/dev/null 2>&1 || return 0
     apk info -e glibc >/dev/null 2>&1 && apk info -e glibc-bin >/dev/null 2>&1 && return 0
-    local version="${SINGBOX_ALPINE_GLIBC_VERSION:-2.35-r1}" base="${SINGBOX_ALPINE_GLIBC_BASE:-https://github.com/sgerrand/alpine-pkg-glibc/releases/download}"
-    mkdir -p /etc/apk/keys
-    _download_file https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub /etc/apk/keys/sgerrand.rsa.pub || return 1
-    local tmp; tmp=$(mktemp -d) || return 1
-    _download_file "$base/$version/glibc-$version.apk" "$tmp/glibc.apk" || { rm -rf "$tmp"; return 1; }
-    _download_file "$base/$version/glibc-bin-$version.apk" "$tmp/glibc-bin.apk" || { rm -rf "$tmp"; return 1; }
-    apk add --no-cache "$tmp/glibc.apk" "$tmp/glibc-bin.apk" >/dev/null 2>&1
-    local rc=$?; rm -rf "$tmp"; return $rc
-}
+    local version="${SINGBOX_ALPINE_GLIBC_VERSION:-2.35-r1}" base tmp key index=0
+    local primary="${SINGBOX_ALPINE_GLIBC_BASE:-https://github.com/sgerrand/alpine-pkg-glibc/releases/download}"
+    local -a mirrors=()
+    [[ "$version" =~ ^[0-9]+(\.[0-9]+)+-r[0-9]+$ ]] || return 1
+    IFS=$' \t\n' read -r -d '' -a mirrors < <(printf '%s\0' "${SINGBOX_ALPINE_GLIBC_MIRRORS:-}")
+    tmp=$(mktemp -d /tmp/sb-glibc.XXXXXX) || return 1
+    trap 'rm -rf -- "$tmp"' EXIT
+    mkdir "$tmp/keys" || return 1
+    for key in /etc/apk/keys/*.pub; do
+        [ -f "$key" ] || continue
+        cp -- "$key" "$tmp/keys/" || return 1
+    done
+    # 镜像只提供 APK，签名公钥不随镜像切换，也不写入全局信任目录。
+    if [ ! -s "$tmp/keys/sgerrand.rsa.pub" ]; then
+        _download_file https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub "$tmp/keys/sgerrand.rsa.pub" || return 1
+    fi
+    for base in "$primary" "${mirrors[@]}"; do
+        ((++index))
+        [[ "$base" == https://?* ]] || return 1
+        base=${base%/}
+        if [ "$index" -gt 1 ]; then _info "尝试 glibc 备用源 #$((index - 1))。"; fi
+        _download_install_asset "$base/$version/glibc-$version.apk" "$tmp/glibc-$version.apk" || continue
+        _download_install_asset "$base/$version/glibc-bin-$version.apk" "$tmp/glibc-bin-$version.apk" || continue
+        apk --keys-dir "$tmp/keys" verify "$tmp/glibc-$version.apk" "$tmp/glibc-bin-$version.apk" || {
+            _error "glibc APK 签名或内容验证失败，停止安装。"; return 1;
+        }
+        _with_package_proxy apk --keys-dir "$tmp/keys" --timeout 15 add --no-cache "$tmp/glibc-$version.apk" "$tmp/glibc-bin-$version.apk"
+        return $?
+    done
+    return 1
+)
 
 _install_dependencies() {
     local force="${1:-false}"
@@ -1532,7 +1820,7 @@ _install_dependencies() {
     fi
 
     _info "正在安装核心依赖..."
-    _pkg_install $core_pkgs
+    _pkg_install $core_pkgs || _warn "核心软件包安装未全部成功，将检查本机已有的工具。请确认软件源能通过 IPv6 或 INSTALL_PACKAGE_PROXY 访问。"
     if command -v apk >/dev/null 2>&1; then
         _ensure_alpine_glibc || { _error "Alpine GNU glibc 安装失败，无法运行 Nowhere 核心。"; return 1; }
     fi
@@ -1578,8 +1866,8 @@ _install_dependencies() {
     fi
     if [ -n "$missing" ]; then
         _error "以下关键依赖安装失败:${missing}"
-        _error "请使用系统包管理器手动安装这些工具（如 apk add / apt-get install / yum install）"
-        exit 1
+        _error "请检查软件源的 IPv6 连通性，或为包管理器设置 INSTALL_PACKAGE_PROXY。"
+        return 1
     fi
 
     mkdir -p "$SINGBOX_DIR"
@@ -1666,18 +1954,25 @@ _install_sing_box_custom() {
         archive_source="$SINGBOX_ARCHIVE_URL"
     fi
     _info "正在获取包含 Nowhere 协议的 sing-box 核心包..."
+    local archive_sha="${SINGBOX_ARCHIVE_SHA256:-}" archive_mirrors="${SINGBOX_ARCHIVE_MIRRORS:-}"
     if [[ "$archive_source" == https://* ]]; then
-        _download_file "$archive_source" "$archive_path" || {
-            _error "Nowhere 核心包下载失败: $archive_source"
-            rm -rf "$temp_dir"
-            return 1
-        }
+        local automatic_mirrors
+        automatic_mirrors=$(_github_install_mirrors "$archive_source")
+        if [ -z "$archive_sha" ] && { [ -n "$archive_mirrors$automatic_mirrors" ] || [[ "$archive_source" != https://github.com/jokjit/nowhere-singbox/releases/download/* ]]; }; then
+            _warn "未设置 Nowhere SHA-256：第三方下载源的内容未经独立校验，请只使用可信源。"
+        fi
+        _download_sources "$archive_source" "$archive_path" "$archive_sha" "$archive_mirrors $automatic_mirrors" || { rm -rf -- "$temp_dir"; return 1; }
     else
         cp -f -- "$archive_source" "$archive_path" || {
             _error "无法读取 Nowhere 核心包: $archive_source"
-            rm -rf "$temp_dir"
+            rm -rf -- "$temp_dir"
             return 1
         }
+        if [ -n "$archive_sha" ] && ! _verify_install_sha256 "$archive_path" "$archive_sha"; then
+            _error "本地 Nowhere 核心包 SHA-256 不匹配。"
+            rm -rf -- "$temp_dir"
+            return 1
+        fi
     fi
 
     extractor=$(_archive_extractor) || {
@@ -1831,7 +2126,7 @@ _install_cloudflared() {
         download_url="$CLOUDFLARED_DOWNLOAD_URL"
         asset_digest="sha256:${CLOUDFLARED_SHA256,,}"
     else
-        release_json=$(_download_text "${CLOUDFLARED_RELEASE_API_URL:-https://api.github.com/repos/cloudflare/cloudflared/releases/latest}") || {
+        release_json=$(_download_release_json "${CLOUDFLARED_RELEASE_API_URL:-https://api.github.com/repos/cloudflare/cloudflared/releases/latest}") || {
             _error "无法访问 cloudflared 发布 API。IPv6-only 环境可设置 CLOUDFLARED_RELEASE_API_URL，或同时设置 CLOUDFLARED_DOWNLOAD_URL 与 CLOUDFLARED_SHA256 使用可信镜像。"
             return 1
         }
@@ -1854,20 +2149,10 @@ _install_cloudflared() {
     mkdir -p "$(dirname "$CLOUDFLARED_BIN")" || return 1
     local tmp_cloudflared
     tmp_cloudflared=$(mktemp "$(dirname "$CLOUDFLARED_BIN")/.cloudflared.new.XXXXXX") || return 1
-    if ! _download_file "$download_url" "$tmp_cloudflared"; then
-        rm -f "$tmp_cloudflared"
-        _error "cloudflared 下载失败!"
-        return 1
-    fi
     expected="${asset_digest#sha256:}"
-    if command -v sha256sum &>/dev/null; then
-        actual=$(sha256sum "$tmp_cloudflared" | awk '{print $1}')
-    else
-        actual=$(openssl dgst -sha256 "$tmp_cloudflared" 2>/dev/null | awk '{print $NF}')
-    fi
-    if [ -z "$actual" ] || [ "${actual,,}" != "$expected" ]; then
+    if ! _download_verified_sources "$download_url" "$tmp_cloudflared" "$expected" "${CLOUDFLARED_DOWNLOAD_MIRRORS:-} $(_github_install_mirrors "$download_url")"; then
         rm -f -- "$tmp_cloudflared"
-        _error "cloudflared SHA-256 校验失败，已拒绝安装。"
+        _error "cloudflared 下载或 SHA-256 校验失败。"
         return 1
     fi
     chmod 755 "$tmp_cloudflared" || { rm -f "$tmp_cloudflared"; return 1; }
@@ -7835,7 +8120,7 @@ _do_update_singbox() {
     _info "--- 安装/更新 Sing-box 核心 ---"
     # 更新核心时复用已验证的依赖缓存，避免在 128M 容器中再次触发 apk
     # 的高峰内存占用；缓存缺项时 _install_dependencies 仍会自愈安装。
-    _install_dependencies
+    _install_dependencies || return 1
     if ! _install_sing_box "$install_target"; then
         _error "Sing-box 核心安装/更新失败。"
         return 1
@@ -7923,23 +8208,23 @@ _do_update_xray() {
     tmp_dir=$(mktemp -d /var/tmp/.xray-install.XXXXXX) || return 1
     local tmp_zip="${tmp_dir}/xray.zip"
 
-    _info "下载地址: ${download_url}"
-    if ! _download_file "$download_url" "$tmp_zip" || ! _download_file "$digest_url" "${tmp_zip}.dgst"; then
-        _error "Xray 安装包或官方摘要下载失败！"
-        rm -rf "$tmp_dir"
-        return 1
+    local expected="${XRAY_DOWNLOAD_SHA256:-}" mirrors="${XRAY_DOWNLOAD_MIRRORS:-}"
+    if [ -z "$expected" ]; then
+        if [ -n "$mirrors" ]; then
+            _error "Xray 多源下载需要预先可信的 XRAY_DOWNLOAD_SHA256。"
+            rm -rf -- "$tmp_dir"
+            return 1
+        fi
+        if ! _download_install_asset "$digest_url" "${tmp_zip}.dgst"; then
+            _error "Xray 官方摘要下载失败。"
+            rm -rf -- "$tmp_dir"
+            return 1
+        fi
+        expected=$(awk -F'= *' 'toupper($1) == "SHA2-256" || toupper($1) == "SHA256" {print $2; exit}' "${tmp_zip}.dgst" | tr -d ' \r\n')
     fi
-
-    local expected actual
-    expected=$(awk -F'= *' 'toupper($1) == "SHA2-256" || toupper($1) == "SHA256" {print $2; exit}' "${tmp_zip}.dgst" | tr -d ' \r\n')
-    if command -v sha256sum &>/dev/null; then
-        actual=$(sha256sum "$tmp_zip" | awk '{print $1}')
-    else
-        actual=$(openssl dgst -sha256 "$tmp_zip" 2>/dev/null | awk '{print $NF}')
-    fi
-    if [ -z "$expected" ] || [ -z "$actual" ] || [ "${expected,,}" != "${actual,,}" ]; then
-        _error "Xray 安装包 SHA-256 校验失败，已拒绝替换核心。"
-        rm -rf "$tmp_dir"
+    if ! _download_verified_sources "$download_url" "$tmp_zip" "$expected" "$mirrors $(_github_install_mirrors "$download_url")"; then
+        _error "Xray 安装包下载或 SHA-256 校验失败，已拒绝替换核心。"
+        rm -rf -- "$tmp_dir"
         return 1
     fi
 
@@ -9098,7 +9383,7 @@ main() {
     chmod 700 "${SINGBOX_DIR}" 2>/dev/null || true
 
     # 1. 首次安装或依赖状态失效时才完整检查，避免每次 sb 进入菜单都触发包管理器
-    _install_dependencies
+    _install_dependencies || return 1
 
     # 2. 根据核心安装状态决定初始化路径
     if [ -f "${SINGBOX_BIN}" ]; then
